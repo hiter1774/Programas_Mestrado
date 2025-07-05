@@ -1,0 +1,662 @@
+// Includes Arduino libraries
+#include <Arduino.h>
+#include <math.h> // For roundf
+#include <Preferences.h> // For non-volatile storage (EEPROM virtual)
+
+// --- Pin Definitions ---
+#define PUL_PIN         18 // Pulse signal (manual GPIO)
+#define DIR_PIN         19
+#define ENA_PIN         21
+#define LIMIT_SWITCH_PIN 22 // Optical limit switch pin
+
+// --- Motor/Driver Configuration ---
+#define PULSES_PER_REVOLUTION 3200.0f // 3200 pulses/revolution for smoother movement
+#define DEGREES_PER_PULSE     (360.0f / PULSES_PER_REVOLUTION) // 360/3200 = 0.1125 degrees/pulse
+
+// --- Homing Parameters ---
+#define HOMING_SEARCH_SPEED_HZ 50    // Homing search frequency in Hz
+#define HOMING_STOP_DELAY_MS   2000 // Delay after hitting sensor for motor to fully stop before considering homed
+static const float G_BACKTRACK_DEGREES = 2.0f;  // Recuo ESPECÍFICO do homing
+static const float AUTO_BACKOFF_DEGREES = 2.0f; // Graus para recuar automaticamente do sensor (fora do homing)
+
+// --- Fixed Calibration Constants (for Python GUI) ---
+#define CALIBRATION_POINTS 3 
+static const float CALIBRATION_THEORETICAL_ANGLES_FIXED[CALIBRATION_POINTS] = {90.0f, 180.0f, 270.0f};
+
+// --- NVS Namespace and Keys ---
+#define CALIB_NAMESPACE "motor_calib" // Namespace for NVS
+#define CALIB_FACTOR_KEY "factor"
+#define CALIB_OFFSET_KEY "offset"
+#define CALIB_HOMED_KEY "homed"
+
+// --- Global Enumerations ---
+enum motor_direction_t {
+    FORWARD = 0,
+    REVERSE = 1
+};
+
+// --- MOTOR CONTROL STATES (Single and Complete State Machine - Consistent Names) ---
+enum MotorControlState { 
+    STATE_IDLE = 0,               // Motor parado e aguardando comando
+    STATE_MOVING_ANGULAR = 1,     // Movendo para um ângulo específico
+    STATE_HOMING_SEARCHING = 2,   // Buscando o fim de curso no homing
+    STATE_HOMING_PAUSE = 3,       // Pausa após encontrar o sensor no homing
+    STATE_HOMING_BACKTRACK = 4,   // Recuando do fim de curso no homing
+    STATE_AUTO_BACKOFF = 5,       // Automatic back-off from limit switch (agora inclui o backtrack do homing)
+    STATE_STOPPING_REQUESTED = 6  // Sinal de parada recebido, transicionando para IDLE
+};
+
+// --- Variáveis de Controle Globais (Todas com prefixo g_ para garantir unicidade e visibilidade) ---
+volatile bool g_motor_is_enabled = true; 
+volatile bool g_motor_is_moving_flag = false; // Flag geral de movimento
+volatile motor_direction_t g_current_direction = FORWARD;
+
+volatile float g_target_degrees_request = 0; 
+volatile uint32_t g_target_frequency_hz_request = 0; 
+volatile int g_total_pulses_to_deliver = 0; // Total COMPLETE pulsos a serem entregues
+volatile bool g_new_move_request_flag = false; 
+
+volatile bool g_limit_switch_active_flag = false; 
+volatile bool g_motor_homed_flag = false; 
+volatile bool g_homing_in_progress_flag = false; // Flag for homing process in progress
+volatile bool g_backoff_is_for_homing = false; // Indica se o auto-recuo atual é parte do processo de homing
+
+
+volatile float g_calibration_factor = 1.0f; 
+volatile float g_calibration_offset = 0.0f; 
+volatile int g_calibration_data_count = 0; 
+
+float g_cal_theoretical_points[CALIBRATION_POINTS]; 
+float g_cal_measured_points[CALIBRATION_POINTS];   
+
+Preferences g_preferences_nvs; // NVS Preferences object
+
+// --- PULSE CONTROL STATE MACHINE VARIABLES ---
+volatile MotorControlState g_current_motor_control_state = STATE_IDLE; 
+
+unsigned long g_last_pulse_time_micros = 0; 
+uint32_t g_pulse_cycle_interval_us = 0; // Duration of ONE FULL PULSE CYCLE (HIGH + LOW)
+volatile bool g_pulse_output_high = false; 
+volatile bool g_pulse_started = false; 
+// g_pulses_generated_count is no longer used for direct counting.
+
+// Variável para temporizar a pausa do homing (usa millis)
+unsigned long g_homing_pause_start_time_ms = 0;
+
+
+// --- Function Prototypes ---
+void motor_enable(bool enable);
+void motor_stop_movement(void); 
+void motor_start_movement(motor_direction_t direction, uint32_t frequency_hz, int total_pulses);
+void motor_move_degrees(motor_direction_t direction, float degrees, uint32_t frequency_hz);
+void motor_home(motor_direction_t homing_direction, uint32_t homing_speed_hz, float backtrack_degrees_not_used); 
+void uart_send_message(const char* message);
+void process_serial_command(String command); 
+void calibrate_motor_min_squares(float *theoretical_angles, float *measured_angles, int num_points); 
+void load_calibration_data(); 
+void save_calibration_data(); 
+void save_homed_status_only(); // NOVO: Salva APENAS o status homed
+void reset_calibration_data(); 
+// The handle_motor_state_machine_logic() function logic is directly in loop()
+
+// --- Function Implementations ---
+
+void motor_enable(bool enable) {
+    digitalWrite(ENA_PIN, enable ? LOW : HIGH); 
+    g_motor_is_enabled = enable;
+    if (enable) {
+        Serial.println("MOTOR: Driver Habilitado.");
+        uart_send_message("ACK_HABILITADO\n");
+        g_limit_switch_active_flag = digitalRead(LIMIT_SWITCH_PIN); 
+        g_motor_homed_flag = false; // On enable, assume not homed
+        uart_send_message("ACK_LIMIT_SWITCH_RESET\n");
+        
+        // Report homing status (loaded from NVS) to GUI
+        if (g_motor_homed_flag) {
+            uart_send_message("ACK_HOMING_CONCLUIDO\n");
+        } else {
+            uart_send_message("ACK_NOT_HOMED\n");
+        }
+    } else {
+        Serial.println("MOTOR: Driver Desabilitado.");
+        motor_stop_movement(); 
+        uart_send_message("ACK_DESABILITADO\n");
+    }
+}
+
+void motor_stop_movement() {
+    // This function is called by process_serial_command("PARAR") or by the loop's universal stop logic.
+    // It should *always* transition to STATE_IDLE and reset movement flags.
+    
+    // Check if we are already idle AND NOT in a homing process.
+    if (g_current_motor_control_state == STATE_IDLE && !g_homing_in_progress_flag) { 
+        return; 
+    }
+
+    g_current_motor_control_state = STATE_IDLE; // Set state machine to idle
+    
+    digitalWrite(PUL_PIN, LOW); // Ensure PUL pin is LOW
+    
+    // Reset all movement/homing control variables
+    g_motor_is_moving_flag = false; 
+    g_total_pulses_to_deliver = 0; 
+    // g_pulses_generated_count is no longer used for counting.
+    g_pulse_output_high = false; 
+    g_pulse_started = false; 
+    
+    // Important: Reset g_homing_in_progress_flag based on context
+    // If this stop was initiated by an external "PARAR" command during homing,
+    // we explicitly log it and reset the flag.
+    if (g_homing_in_progress_flag) {
+        Serial.println("MOTOR_CTRL_TASK: Homing process terminated by manual stop or limit switch interference.");
+        uart_send_message("NACK_HOMING_FAILED_INTERRUPTED\n");
+        g_homing_in_progress_flag = false; // Explicitly mark homing as ended
+        g_backoff_is_for_homing = false; // Reset backoff context flag as homing is interrupted
+    } else {
+        Serial.println("MOTOR: Motor parado.");
+        uart_send_message("ACK_PARADO\n");
+    }
+}
+
+// Function to start movement (configures parameters and activates state machine)
+void motor_start_movement(motor_direction_t direction, uint32_t frequency_hz, int total_pulses) {
+    Serial.println("START_MOVE: Checking conditions to start movement...");
+    if (!g_motor_is_enabled) {
+        Serial.println("START_MOVE: Motor disabled. Cannot start.");
+        uart_send_message("NACK_MOTOR_DESABILITADO\n");
+        return;
+    }
+    
+    if (g_current_motor_control_state != STATE_IDLE) { // Check if state machine is not IDLE
+        Serial.println("START_MOVE: Motor already moving. Cannot start new move.");
+        uart_send_message("NACK_MOTOR_OCUPADO\n");
+        return;
+    }
+
+    // Configure parameters for the state machine in loop()
+    g_motor_is_moving_flag = true; 
+    digitalWrite(DIR_PIN, direction);
+    
+    g_pulse_cycle_interval_us = 1000000 / frequency_hz; // Full pulse cycle duration
+    if (g_pulse_cycle_interval_us < 20) g_pulse_cycle_interval_us = 20; // Min 10us HIGH, 10us LOW
+
+    // g_pulses_generated_count is no longer used for counting.
+    g_total_pulses_to_deliver = total_pulses; 
+    g_last_pulse_time_micros = micros(); 
+    
+    g_pulse_output_high = false; // Start with PUL pin LOW, first transition will be HIGH
+    g_pulse_started = true; 
+
+    g_current_motor_control_state = STATE_MOVING_ANGULAR; // Set angular movement state
+    g_homing_in_progress_flag = false; // Ensure not in homing state (for normal movement)
+    g_backoff_is_for_homing = false; // Ensure backoff context is clear for normal moves
+    
+    Serial.print("MOTOR: Requesting move. Pulses: ");
+    Serial.print(total_pulses);
+    Serial.print(". Frequency: ");
+    Serial.print(frequency_hz);
+    Serial.print(" Hz. Pulse Cycle Duration: ");
+    Serial.print(g_pulse_cycle_interval_us);
+    Serial.println(" us.");
+    uart_send_message("ACK_MOVIMENTO_INICIADO\n");
+}
+
+void motor_move_degrees(motor_direction_t direction, float degrees, uint32_t frequency_hz) {
+    if (degrees < 0 || degrees > 360) {
+        Serial.print("MOTOR: Angle out of range (0-360): ");
+        Serial.print(degrees);
+        Serial.println(" degrees. No movement.");
+        uart_send_message("NACK_ANGULO_RANGE_INVALIDO\n");
+        return;
+    }
+    
+    float calibrated_degrees = degrees; 
+    if (g_calibration_factor != 1.0f) { 
+        calibrated_degrees = degrees / g_calibration_factor; 
+        Serial.print("MOTOR: Angle adjusted for calibration: ");
+        Serial.print(calibrated_degrees, 3);
+        Serial.println(" degrees.");
+    }
+
+    int required_pulses = (int)roundf(calibrated_degrees * (PULSES_PER_REVOLUTION / 360.0f));
+    
+    if (required_pulses <= 0) {
+        Serial.print("MOTOR: Angle too small or invalid (");
+        Serial.print(degrees);
+        Serial.println(" degrees). No movement.");
+        uart_send_message("NACK_ANGULO_INVALIDO\n");
+        return;
+    }
+    
+    motor_start_movement(direction, frequency_hz, required_pulses);
+}
+
+// Funcao motor_home AGORA DISPARA AUTO-RECUO e FINALIZA HOMING
+void motor_home(motor_direction_t homing_direction, uint32_t homing_speed_hz, float backtrack_degrees_not_used) {
+    Serial.println("HOME: HOME command received.");
+    if (!g_motor_is_enabled) {
+        Serial.println("HOME: Motor disabled. Cannot start.");
+        uart_send_message("NACK_MOTOR_DESABILITADO\n");
+        return;
+    }
+    if (g_current_motor_control_state != STATE_IDLE) { // Check if state machine is not IDLE
+        Serial.println("HOME: Motor already moving. Stop before homing.");
+        uart_send_message("NACK_MOTOR_OCUPADO\n");
+        return;
+    }
+
+    g_homing_in_progress_flag = true; // Set homing in progress flag
+    g_motor_homed_flag = false; // Assume not homed until process completes
+    g_limit_switch_active_flag = digitalRead(LIMIT_SWITCH_PIN); // Read initial sensor state
+
+    Serial.println("HOME: Starting homing process...");
+    uart_send_message("ACK_HOMING_STARTED\n");
+
+    Serial.print("HOME: Searching for limit switch in direction ");
+    Serial.print(homing_direction == FORWARD ? "FORWARD" : "REVERSE");
+    Serial.print(" at ");
+    Serial.print(homing_speed_hz);
+    Serial.println(" Hz.");
+    
+    // Use the fixed homing speed (HOMING_SEARCH_SPEED_HZ)
+    uint32_t actual_homing_freq = HOMING_SEARCH_SPEED_HZ; 
+    g_pulse_cycle_interval_us = 1000000 / actual_homing_freq; // Full pulse cycle duration
+    if (g_pulse_cycle_interval_us < 20) g_pulse_cycle_interval_us = 20; // Min 10us HIGH, 10us LOW
+
+    // Configure parameters for the search (state machine)
+    digitalWrite(DIR_PIN, REVERSE); // Always go REVERSE for homing as per request
+    // g_pulses_generated_count is no longer used.
+    g_total_pulses_to_deliver = -1; // -1 means continuous movement for homing search
+    g_last_pulse_time_micros = micros();
+    
+    g_pulse_output_high = false; // Start with PUL pin LOW
+    g_pulse_started = true;
+    g_current_motor_control_state = STATE_HOMING_SEARCHING; // Start homing search state
+    g_motor_is_moving_flag = true; // CRITICAL: Ensure this is true to allow loop() to run homing
+    g_backoff_is_for_homing = true; // IMPORTANT: Set this flag when homing starts, for STATE_AUTO_BACKOFF
+}
+
+
+void uart_send_message(const char* message) {
+    Serial.print(message); 
+}
+
+void process_serial_command(String command) {
+    Serial.print("UART_TASK: Received (cleaned): '");
+    Serial.print(command);
+    Serial.println("'");
+    uart_send_message(command.c_str()); 
+    uart_send_message("\n");
+
+    if (command == "HABILITAR") {
+        motor_enable(true);
+    } else if (command == "DESABILITAR") {
+        motor_enable(false);
+    } else if (command == "PARAR") {
+        motor_stop_movement(); 
+    } else if (command == "DIR FRENTE") {
+        g_current_direction = FORWARD;
+        Serial.println("MOTOR: Direction set to FORWARD.");
+        uart_send_message("ACK_DIR_FRENTE\n");
+    } else if (command == "DIR RE") {
+        g_current_direction = REVERSE;
+        Serial.println("MOTOR: Direction set to REVERSE.");
+        uart_send_message("ACK_DIR_RE\n");
+    } else if (command.startsWith("MOVER ANGULO ")) {
+        String data_str = command.substring(String("MOVER ANGULO ").length());
+        int spaceIndex = data_str.indexOf(' ');
+        
+        float degrees = 0;
+        uint32_t frequency_hz = 50; 
+
+        if (spaceIndex != -1) { 
+            String freq_str = data_str.substring(spaceIndex + 1);
+            String degrees_str = data_str.substring(0, spaceIndex); 
+            
+            degrees = degrees_str.toFloat();
+            frequency_hz = freq_str.toInt();
+            if (frequency_hz < 1 || frequency_hz > 200) { 
+                Serial.println("UART_TASK: Invalid angular frequency. Using default (50Hz).");
+                frequency_hz = 50;
+            }
+        } else { 
+            degrees = data_str.toFloat(); 
+            frequency_hz = 50; 
+        }
+        motor_move_degrees(g_current_direction, degrees, frequency_hz);
+    } else if (command.startsWith("CALIBRAR ")) { 
+        // Command: CALIBRAR <theoretical1>,<measured1>;<theoretical2>,<measured2>;<theoretical3>,<measured3>
+        String all_data_str = command.substring(String("CALIBRAR ").length());
+        float theoretical_vals[CALIBRATION_POINTS];
+        float measured_vals[CALIBRATION_POINTS];
+        int current_point = 0;
+
+        while (all_data_str.length() > 0 && current_point < CALIBRATION_POINTS) {
+            int semicolon_index = all_data_str.indexOf(';');
+            String point_str;
+            if (semicolon_index != -1) {
+                point_str = all_data_str.substring(0, semicolon_index);
+                all_data_str = all_data_str.substring(semicolon_index + 1);
+            } else {
+                point_str = all_data_str;
+                all_data_str = ""; // Last point
+            }
+
+            int comma_index = point_str.indexOf(',');
+            if (comma_index != -1) {
+                theoretical_vals[current_point] = point_str.substring(0, comma_index).toFloat();
+                measured_vals[current_point] = point_str.substring(comma_index + 1).toFloat();
+                current_point++;
+            }
+        }
+
+        if (current_point == CALIBRATION_POINTS) {
+            calibrate_motor_min_squares(theoretical_vals, measured_vals, CALIBRATION_POINTS);
+        } else {
+            Serial.println("CALIBRATION: NACK_CALIBRATION_DATA_INCOMPLETE");
+            uart_send_message("NACK_CALIBRATION_DATA_INCOMPLETE\n");
+        }
+
+    } else if (command == "HOME") { 
+        motor_home(REVERSE, HOMING_SEARCH_SPEED_HZ, G_BACKTRACK_DEGREES); 
+    } else if (command == "RESET_CALIB") { 
+        reset_calibration_data();
+    }
+    else {
+        Serial.print("UART_TASK: Unknown or malformed command: '");
+        Serial.print(command);
+        Serial.println("'");
+        uart_send_message("NACK_UNKNOWN_COMMAND\n");
+    }
+}
+
+void calibrate_motor_min_squares(float *theoretical_angles, float *measured_angles, int num_points) {
+    float sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
+    
+    for (int i = 0; i < num_points; i++) {
+        sum_x += theoretical_angles[i];
+        sum_y += measured_angles[i];
+        sum_xy += theoretical_angles[i] * measured_angles[i];
+        sum_x2 += theoretical_angles[i] * theoretical_angles[i];
+    }
+
+    float denominator = (num_points * sum_x2 - sum_x * sum_x);
+    if (denominator == 0) { 
+        Serial.println("CALIBRATION: Calibration error: Division by zero. Theoretical points equal?");
+        uart_send_message("NACK_CALIBRATION_ERROR\n");
+        g_calibration_factor = 1.0f; // Ensure not 0
+        g_calibration_offset = 0.0f;
+        save_calibration_data(); 
+        return;
+    }
+
+    g_calibration_factor = (num_points * sum_xy - sum_x * sum_y) / denominator;
+    g_calibration_offset = (sum_y - g_calibration_factor * sum_x) / num_points;
+
+    // Critical: If calibration factor is very close to zero, reset to 1.0
+    if (fabs(g_calibration_factor) < 0.000001f) { 
+        Serial.println("CALIBRATION: Calibration factor very close to zero. Resetting to 1.0.");
+        uart_send_message("NACK_CALIBRATION_FACTOR_ZERO\n");
+        g_calibration_factor = 1.0f;
+        g_calibration_offset = 0.0f;
+    }
+
+    Serial.print("CALIBRATION: Calibration complete. Factor (m): ");
+    Serial.print(g_calibration_factor, 6); 
+    Serial.print(", Offset (c): ");
+    Serial.println(g_calibration_offset, 6);
+    uart_send_message("ACK_CALIBRATION_COMPLETE\n");
+    save_calibration_data(); 
+}
+
+void load_calibration_data() {
+    g_preferences_nvs.begin(CALIB_NAMESPACE, true); 
+    g_calibration_factor = g_preferences_nvs.getFloat(CALIB_FACTOR_KEY, 1.0f); 
+    g_calibration_offset = g_preferences_nvs.getFloat(CALIB_OFFSET_KEY, 0.0f);
+    g_motor_homed_flag = g_preferences_nvs.getBool(CALIB_HOMED_KEY, false); 
+    g_preferences_nvs.end();
+    Serial.println("CALIBRATION: Calibration data loaded.");
+
+    // Ensure calibration factor is not 0, reset to 1.0 if it is to avoid division by zero.
+    if (g_calibration_factor == 0.0f) {
+        g_calibration_factor = 1.0f;
+        Serial.println("CALIBRATION: Calibration factor 0.0 detected, reset to 1.0.");
+    }
+}
+
+void save_calibration_data() {
+    g_preferences_nvs.begin(CALIB_NAMESPACE, false); 
+    g_preferences_nvs.putFloat(CALIB_FACTOR_KEY, g_calibration_factor);
+    g_preferences_nvs.putFloat(CALIB_OFFSET_KEY, g_calibration_offset);
+    g_preferences_nvs.putBool(CALIB_HOMED_KEY, g_motor_homed_flag); 
+    g_preferences_nvs.end();
+    Serial.println("CALIBRATION: Calibration data saved.");
+}
+
+// Function to reset calibration to default values
+void reset_calibration_data() {
+    g_calibration_factor = 1.0f;
+    g_calibration_offset = 0.0f;
+    g_motor_homed_flag = false; // Also reset homed status
+    save_calibration_data(); // Save to NVS
+    Serial.println("CALIBRATION: Calibration reset to default.");
+    uart_send_message("ACK_CALIBRATION_RESET\n"); 
+    uart_send_message("ACK_NOT_HOMED\n"); 
+}
+
+void setup() {
+    Serial.begin(115200); 
+    delay(100); 
+
+    pinMode(PUL_PIN, OUTPUT);
+    pinMode(DIR_PIN, OUTPUT);
+    pinMode(ENA_PIN, OUTPUT);
+    pinMode(LIMIT_SWITCH_PIN, INPUT_PULLDOWN); 
+    
+    load_calibration_data(); 
+
+    motor_enable(true); 
+
+    Serial.println("MAIN: System ready. Waiting for GUI commands.");
+    uart_send_message("ACK_UART_READY\n");
+    
+    if (g_motor_homed_flag) {
+        uart_send_message("ACK_HOMING_CONCLUIDO\n");
+    } else {
+        uart_send_message("ACK_NOT_HOMED\n");
+    }
+
+    g_cal_theoretical_points[0] = 90.0f;
+    g_cal_theoretical_points[1] = 180.0f;
+    g_cal_theoretical_points[2] = 270.0f;
+
+    Serial.print("CALIBRATION: Current calibration factor: ");
+    Serial.print(g_calibration_factor, 6);
+    Serial.print(", Offset: ");
+    Serial.println(g_calibration_offset, 6);
+}
+
+void loop() {
+    // --- Polling for Limit Switch ---
+    static bool last_sensor_state = false;
+    bool current_sensor_state = digitalRead(LIMIT_SWITCH_PIN);
+
+    // This block correctly updates g_limit_switch_active_flag.
+    if (current_sensor_state != last_sensor_state) { 
+        if (current_sensor_state == HIGH) { 
+            g_limit_switch_active_flag = true; 
+            Serial.println("LIMIT_SWITCH_TASK: Limit switch ACTIVE (via polling).");
+            uart_send_message("WARNING_LIMIT_SWITCH_ACTIVE\n"); 
+        } else { 
+            g_limit_switch_active_flag = false; 
+            Serial.println("LIMIT_SWITCH_TASK: Limit switch DEACTIVATED (via polling).");
+            uart_send_message("ACK_LIMIT_SWITCH_RESET\n"); 
+        }
+    }
+    last_sensor_state = current_sensor_state;
+
+    // --- Serial Command Processing ---
+    if (Serial.available()) {
+        String command = Serial.readStringUntil('\n'); 
+        command.trim(); 
+        process_serial_command(command);
+    }
+
+    // --- Motor Movement State Machine (NON-BLOCKING) ---
+    // If motor is NOT idle
+    if (g_current_motor_control_state != STATE_IDLE) { 
+        // Check immediate stop conditions
+        // PRIORITY 1: Manual Stop Command (g_motor_is_moving_flag becomes false by process_serial_command)
+        if (!g_motor_is_moving_flag) { 
+            motor_stop_movement(); 
+            Serial.println("MOTOR_CTRL_TASK: Movement stopped MANUALLY.");
+            return; 
+        }
+
+        // PRIORITY 2: Limit Switch Activated (UNIVERSAL STOP + AUTO BACKOFF or HOMING TRANSITION)
+        // This check applies regardless of whether homing is in progress, but the reaction differs.
+        if (digitalRead(LIMIT_SWITCH_PIN) == HIGH) { // Check if sensor is physically active
+            // Case A: Not in homing, and limit switch hit unexpectedly -> Auto Backoff
+            // IMPORTANT: Only trigger if we are NOT currently in the AUTO_BACKOFF state, to prevent re-triggering loop
+            if (!g_homing_in_progress_flag && g_current_motor_control_state != STATE_AUTO_BACKOFF) { 
+                Serial.println("MOTOR_CTRL_TASK: Limit switch ACTIVATED during non-homing movement. Initiating auto-backoff.");
+                uart_send_message("WARNING_LIMIT_SWITCH_HIT\n");
+                
+                // --- Initiating Auto-Backoff ---
+                // Stop current pulses immediately to clear the way for backoff
+                digitalWrite(PUL_PIN, LOW); 
+                g_pulse_started = false; // Stop internal pulse generation for a clean start
+                g_motor_is_moving_flag = false; // Mark as stopped temporarily, will be re-enabled by auto-backoff setup
+                
+                // Set up for backoff movement
+                digitalWrite(DIR_PIN, FORWARD); 
+                g_total_pulses_to_deliver = (int)roundf(AUTO_BACKOFF_DEGREES / DEGREES_PER_PULSE); // Pulses for 5 degrees
+                g_last_pulse_time_micros = micros(); 
+                g_pulse_output_high = false; 
+                g_pulse_started = true; // Restart pulse generation for backoff
+                g_current_motor_control_state = STATE_AUTO_BACKOFF; // Transition to Auto-backoff state
+                g_motor_is_moving_flag = true; // Re-enable movement flag for backoff
+                return; // Exit loop() to restart state machine at new state
+            }
+            // Case B: In homing search, and limit switch hit -> This is handled within the STATE_HOMING_SEARCHING case.
+            // Case C: In auto-backoff state, still on sensor -> continue to let auto-backoff state handle it.
+        }
+        
+        unsigned long current_micros = micros();
+        
+        switch(g_current_motor_control_state) {
+            case STATE_MOVING_ANGULAR:
+                // Generate pulse
+                if (current_micros - g_last_pulse_time_micros >= (g_pulse_cycle_interval_us / 2)) {
+                    g_pulse_output_high = !g_pulse_output_high; // Toggle pin state
+                    digitalWrite(PUL_PIN, g_pulse_output_high ? HIGH : LOW);
+                    g_last_pulse_time_micros = current_micros; // Update time of this transition
+
+                    if (g_pulse_output_high) { // Only decrement on HIGH transition (start of new pulse)
+                        if (g_total_pulses_to_deliver > 0) { 
+                            g_total_pulses_to_deliver--; // Decrement the count of COMPLETE pulses
+                            Serial.print("PULSE_COUNT: "); Serial.println(g_total_pulses_to_deliver); 
+                        }
+                    }
+
+                    if (g_total_pulses_to_deliver == 0 && !g_pulse_output_high) { // Stop if pulses are zero AND pin is LOW
+                         motor_stop_movement(); 
+                         Serial.println("MOTOR_CTRL_TASK: Angular movement complete.");
+                         uart_send_message("ACK_ANGULO_CONCLUIDO\n");
+                         return; 
+                    }
+                }
+                break;
+
+            case STATE_HOMING_SEARCHING:
+                // Generate continuous pulses until limit switch is hit
+                if (current_micros - g_last_pulse_time_micros >= (g_pulse_cycle_interval_us / 2)) {
+                    g_pulse_output_high = !g_pulse_output_high; // Toggle pin state
+                    digitalWrite(PUL_PIN, g_pulse_output_high ? HIGH : LOW);
+                    g_last_pulse_time_micros = current_micros; // Update time of this transition
+                }
+                
+                // CRITICAL CORRECTION FOR HOMING:
+                // When sensor is hit during homing search, directly initiate AUTO_BACKOFF.
+                if (g_limit_switch_active_flag && g_homing_in_progress_flag) { 
+                    // Stop current pulses immediately for a clean transition
+                    digitalWrite(PUL_PIN, LOW); 
+                    g_pulse_output_high = false; 
+                    g_pulse_started = false; 
+                    g_motor_is_moving_flag = false; // Mark as stopped temporarily
+
+                    Serial.println("HOME: Limit switch found. Initiating auto-backoff as part of homing.");
+                    uart_send_message("HOME: Limit switch found. Initiating auto-backoff as part of homing.\n");
+                    
+                    // --- Initiating Auto-Backoff (for Homing) ---
+                    digitalWrite(DIR_PIN, FORWARD); // Move FORWARD to backtrack from limit switch
+                    g_total_pulses_to_deliver = (int)roundf(G_BACKTRACK_DEGREES / DEGREES_PER_PULSE); // Pulses for G_BACKTRACK_DEGREES (5 degrees)
+                    g_last_pulse_time_micros = micros(); 
+                    g_pulse_output_high = false; 
+                    g_pulse_started = true; // Re-enable pulse generation for backoff
+                    
+                    g_current_motor_control_state = STATE_AUTO_BACKOFF; // Transition to Auto-backoff state
+                    g_motor_is_moving_flag = true; // Re-enable movement flag for backoff 
+                    g_backoff_is_for_homing = true; // Set flag to indicate this auto-backoff is for homing
+                    // g_homing_in_progress_flag remains true until auto-backoff for homing finishes successfully.
+                    return; // Exit loop() to process the new state (Auto-Backoff)
+                }
+                break;
+            
+            // REMOVIDO: STATE_HOMING_PAUSE e STATE_HOMING_BACKTRACK foram consolidados com STATE_AUTO_BACKOFF
+
+            case STATE_AUTO_BACKOFF: // Logic for automatic back-off (now universal for normal backoff and homing backtrack)
+                // Generate pulse
+                if (current_micros - g_last_pulse_time_micros >= (g_pulse_cycle_interval_us / 2)) {
+                    g_pulse_output_high = !g_pulse_output_high; // Toggle pin state
+                    digitalWrite(PUL_PIN, g_pulse_output_high ? HIGH : LOW);
+                    g_last_pulse_time_micros = current_micros; // Update time of this transition
+
+                    if (g_pulse_output_high) { // Only decrement on HIGH transition (start of new pulse)
+                        if (g_total_pulses_to_deliver > 0) { 
+                            g_total_pulses_to_deliver--; 
+                            Serial.print("AUTO_BACKOFF_PULSE_COUNT: "); Serial.println(g_total_pulses_to_deliver); 
+                        }
+                    }
+
+                    // Check for completion after decrementing
+                    if (g_total_pulses_to_deliver == 0) { // All back-off pulses delivered
+                        // Finaliza o movimento
+                        g_current_motor_control_state = STATE_IDLE; // Finaliza FSM
+                        digitalWrite(PUL_PIN, LOW); // Garante que o pino PUL está em LOW
+                        g_motor_is_moving_flag = false; 
+                        g_total_pulses_to_deliver = 0; 
+                        g_pulse_output_high = false;
+                        g_pulse_started = false;
+
+                        // Verify that the limit switch is now DEACTIVATED
+                        if (digitalRead(LIMIT_SWITCH_PIN) == LOW) { // Confirma que o sensor está realmente liberado
+                            Serial.println("MOTOR_CTRL_TASK: Auto-backoff complete and limit switch cleared.");
+                            uart_send_message("ACK_AUTO_BACKOFF_COMPLETE\n");
+                        } else {
+                            // If still on sensor after auto-backoff, might need more intervention.
+                            Serial.println("MOTOR_CTRL_TASK: Auto-backoff complete but still on limit switch. Manual intervention may be needed.");
+                            uart_send_message("WARNING_AUTO_BACKOFF_STUCK\n");
+                        }
+
+                        // CRITICAL CORRECTION: Se o auto-recuo foi para o homing, finalize o homing aqui.
+                        if (g_backoff_is_for_homing) {
+                            g_motor_homed_flag = true; 
+                            Serial.println("HOME: Homing process completed successfully after auto-backoff.");
+                            uart_send_message("ACK_HOMING_CONCLUIDO\n");
+                            save_calibration_data(); // Save the homed status
+                            g_homing_in_progress_flag = false; // Finaliza a flag de homing em progresso
+                            g_backoff_is_for_homing = false; // Reseta a flag de contexto
+                        }
+                        return; // Exit switch and loop()
+                    }
+                }
+                break;
+
+            case STATE_IDLE: 
+            case STATE_STOPPING_REQUESTED: 
+                break;
+        }
+    }
+    yield(); 
+}
